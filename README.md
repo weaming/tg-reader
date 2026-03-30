@@ -25,6 +25,8 @@ TG_CHANNEL_USERNAME=channel_a,channel_b
 
 `TG_CHANNEL_USERNAME` 支持英文逗号分隔多个频道。也可通过 `-channels` flag 在运行时覆盖。
 
+`ENV_FILE` 可指定环境变量配置文件路径。
+
 ## 运行
 
 ```bash

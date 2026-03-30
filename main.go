@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"os/signal"
@@ -139,7 +140,12 @@ type AppConfig struct {
 // loadConfig 读取并校验必需的环境变量。
 // TG_CHANNEL_USERNAME 可留空，由调用方通过 -channels flag 覆盖。
 func loadConfig() (*AppConfig, error) {
-	_ = godotenv.Load()
+	envFile := os.Getenv("ENV_FILE")
+	if envFile == "" {
+		envFile = ".env"
+	}
+	log.Printf("正在加载环境变量文件: %s", envFile)
+	_ = godotenv.Load(envFile)
 
 	appIDStr := os.Getenv("TG_API_ID")
 	appHash := os.Getenv("TG_API_HASH")
@@ -642,13 +648,13 @@ write:
 }
 
 func main() {
-	outputPath   := flag.String("output", DEFAULT_OUTPUT, "消息输出文件（JSONL 格式），多频道共用\n被 -output-dir 覆盖时忽略")
-	outputDir    := flag.String("output-dir", "", "消息输出目录，优先级高于 -output\n每个频道写入 {channel username}.jsonl")
+	proxyFlag := flag.String("proxy", "", "SOCKS5 代理地址，格式 socks5://[user:pass@]host:port\n留空则依次读取 ALL_PROXY 环境变量，最终兜底 "+DEFAULT_PROXY)
+	outputPath := flag.String("output", DEFAULT_OUTPUT, "消息输出文件（JSONL 格式），多频道共用\n被 -output-dir 覆盖时忽略")
+	outputDir := flag.String("output-dir", "", "消息输出目录，优先级高于 -output\n每个频道写入 {channel username}.jsonl")
 	channelsFlag := flag.String("channels", "", "要监听的频道用户名，逗号分隔\n覆盖 TG_CHANNEL_USERNAME 环境变量")
-	pageSize     := flag.Int("page-size", DEFAULT_PAGE_SIZE, "每次拉取历史消息的条数，默认 100，最大 "+strconv.Itoa(MAX_PAGE_SIZE))
 	fetchHistory := flag.Bool("history", false, "跳过「是否拉取历史消息」的交互确认，直接开始拉取")
-	stopOnDup    := flag.Bool("auto-stop", false, "翻页时遇到已存在的消息，自动停止而不弹确认提示。\n否则用于回填历史消息空缺。")
-	proxyFlag    := flag.String("proxy", "", "SOCKS5 代理地址，格式 socks5://[user:pass@]host:port\n留空则依次读取 ALL_PROXY 环境变量，最终兜底 "+DEFAULT_PROXY)
+	pageSize := flag.Int("page-size", DEFAULT_PAGE_SIZE, "每次拉取历史消息的条数，默认 100，最大 "+strconv.Itoa(MAX_PAGE_SIZE))
+	stopOnDup := flag.Bool("auto-stop", false, "翻页时遇到已存在的消息，自动停止而不弹确认提示。\n否则用于回填历史消息空缺。")
 	flag.Parse()
 
 	if *pageSize > MAX_PAGE_SIZE {
