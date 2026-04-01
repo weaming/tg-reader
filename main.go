@@ -28,7 +28,7 @@ import (
 
 const (
 	DEFAULT_PROXY     = "socks5://localhost:7890"
-	SESSION_FILE      = ".td.session"
+	SESSION_FILE      = "td.session"
 	DEFAULT_OUTPUT    = "./messages.jsonl"
 	DEFAULT_PAGE_SIZE = 100
 	MAX_PAGE_SIZE     = 100

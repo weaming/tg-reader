@@ -33,7 +33,7 @@ TG_CHANNEL_USERNAME=channel_a,channel_b
 ./tg-reader [flags]
 ```
 
-首次运行会要求输入手机验证码（及两步验证密码），认证成功后 session 保存至 `.td.session`，后续无需重新登录。
+首次运行会要求输入手机验证码（及两步验证密码），认证成功后 session 保存至 `td.session`，后续无需重新登录。
 
 ## 参数
 
