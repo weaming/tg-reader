@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -218,7 +219,13 @@ type MessageRecord struct {
 	ReplyToID     int          `json:"reply_to_id,omitempty"`
 }
 
-// MessageWriter 线程安全的 JSONL 消息写入器
+// MessageSink 消息写入接口
+type MessageSink interface {
+	Write(record MessageRecord) error
+	Close() error
+}
+
+// MessageWriter 单文件线程安全写入器（用于 -output 模式）
 type MessageWriter struct {
 	mu   sync.Mutex
 	file *os.File
@@ -247,9 +254,83 @@ func (w *MessageWriter) Close() error {
 	return w.file.Close()
 }
 
-// loadExistingIDs 读取 JSONL 文件中已有的消息 ID 集合。
-// 指定 channelID > 0 时只收录该频道的 ID（用于多频道共享同一文件的场景）。
-func loadExistingIDs(path string, channelID int64) (map[int]bool, error) {
+// DateRotatingWriter 按 UTC+8 日期分文件写入器（用于 -output-dir 模式）
+// 文件路径格式：{baseDir}/2006-01-02.json
+type DateRotatingWriter struct {
+	mu      sync.Mutex
+	baseDir string
+	files   map[string]*os.File
+	zone    *time.Location
+}
+
+func NewDateRotatingWriter(baseDir string, zone *time.Location) (*DateRotatingWriter, error) {
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return nil, fmt.Errorf("创建输出目录失败 (%s): %w", baseDir, err)
+	}
+	return &DateRotatingWriter{
+		baseDir: baseDir,
+		files:   make(map[string]*os.File),
+		zone:    zone,
+	}, nil
+}
+
+func (w *DateRotatingWriter) dateKey(record MessageRecord) (string, error) {
+	t, err := time.Parse(time.RFC3339, record.Timestamp)
+	if err != nil {
+		return "", fmt.Errorf("解析消息时间戳失败: %w", err)
+	}
+	return t.In(w.zone).Format("2006-01-02"), nil
+}
+
+func (w *DateRotatingWriter) getOrCreateFile(dateKey string) (*os.File, error) {
+	if f, ok := w.files[dateKey]; ok {
+		return f, nil
+	}
+	filePath := filepath.Join(w.baseDir, dateKey+".json")
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("打开日期文件失败 (%s): %w", filePath, err)
+	}
+	w.files[dateKey] = f
+	return f, nil
+}
+
+func (w *DateRotatingWriter) Write(record MessageRecord) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	dateKey, err := w.dateKey(record)
+	if err != nil {
+		return err
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	f, err := w.getOrCreateFile(dateKey)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(f, "%s\n", data)
+	return err
+}
+
+func (w *DateRotatingWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var firstErr error
+	for _, f := range w.files {
+		if err := f.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// loadExistingIDsFromFile 读取单个 JSONL 文件中已有的消息 ID 集合。
+// channelID > 0 时只收录该频道的 ID（多频道共用同一文件时过滤用）。
+func loadExistingIDsFromFile(path string, channelID int64) (map[int]bool, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -274,15 +355,41 @@ func loadExistingIDs(path string, channelID int64) (map[int]bool, error) {
 	return existingIDs, scanner.Err()
 }
 
+// loadExistingIDsFromDir 扫描目录下所有 .json 文件，收集已有的消息 ID 集合。
+func loadExistingIDsFromDir(dirPath string) (map[int]bool, error) {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return make(map[int]bool), nil
+		}
+		return nil, fmt.Errorf("读取输出目录失败 (%s): %w", dirPath, err)
+	}
+
+	existingIDs := make(map[int]bool)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		ids, err := loadExistingIDsFromFile(filepath.Join(dirPath, entry.Name()), 0)
+		if err != nil {
+			return nil, err
+		}
+		for id := range ids {
+			existingIDs[id] = true
+		}
+	}
+	return existingIDs, nil
+}
+
 // ChannelCtx 单个频道的运行时状态
 type ChannelCtx struct {
 	Channel     *tg.Channel
 	Peer        *tg.InputPeerChannel
-	Writer      *MessageWriter
+	Writer      MessageSink
 	ExistingIDs map[int]bool
 }
 
-// channelFileKey 返回频道文件名 key：优先使用 username，否则退回数字 ID
+// channelFileKey 返回频道目录/文件名 key：优先使用 username，否则退回数字 ID
 func channelFileKey(channel *tg.Channel) string {
 	if channel.Username != "" {
 		return channel.Username
@@ -290,27 +397,136 @@ func channelFileKey(channel *tg.Channel) string {
 	return strconv.FormatInt(int64(channel.ID), 10)
 }
 
-// openChannelWriter 根据是否指定输出目录决定写入路径。
-// 有 outputDir 时每个频道单独文件（{outputDir}/{fileKey}.jsonl），否则共用 outputPath。
-func openChannelWriter(outputPath, outputDir, fileKey string) (*MessageWriter, error) {
-	path := outputPath
+// openChannelWriter 根据是否指定输出目录决定写入器类型。
+// 有 outputDir 时返回 DateRotatingWriter（{outputDir}/{fileKey}/{date}.json）；
+// 否则返回共用单文件的 MessageWriter。
+func openChannelWriter(outputPath, outputDir, fileKey string, zone *time.Location) (MessageSink, error) {
 	if outputDir != "" {
-		if err := os.MkdirAll(outputDir, 0755); err != nil {
-			return nil, fmt.Errorf("创建输出目录失败 (%s): %w", outputDir, err)
-		}
-		path = filepath.Join(outputDir, fileKey+".jsonl")
+		channelDir := filepath.Join(outputDir, fileKey)
+		return NewDateRotatingWriter(channelDir, zone)
 	}
-	return NewMessageWriter(path)
+	return NewMessageWriter(outputPath)
 }
 
-// resolveExistingIDsPath 根据输出模式确定读取已有 ID 的文件路径和过滤用的频道 ID
-func resolveExistingIDsPath(outputPath, outputDir, fileKey string, channelID int64) (string, int64) {
-	if outputDir != "" {
-		// 每个频道独立文件，无需按 channelID 过滤
-		return filepath.Join(outputDir, fileKey+".jsonl"), 0
+// loadChannelExistingIDs 根据输出模式加载已有消息 ID。
+// 有 outputDir 时扫描频道子目录下所有 .json 文件；无 outputDir 时从共用文件按 channelID 过滤。
+func loadChannelExistingIDs(outputPath, outputDir, fileKey string, channelID int64) (map[int]bool, error) {
+	if outputDir == "" {
+		return loadExistingIDsFromFile(outputPath, channelID)
 	}
-	// 共享文件，按 channelID 过滤
-	return outputPath, channelID
+	channelDir := filepath.Join(outputDir, fileKey)
+	return loadExistingIDsFromDir(channelDir)
+}
+
+// migrateLegacyJSONL 将旧格式的 {outputDir}/{fileKey}.jsonl 中尚未迁移的记录写入按日期分文件的新格式。
+// 已存在于 existingIDs 中的记录会跳过，避免重复写入。返回是否有实际写入。
+func migrateLegacyJSONL(legacyPath string, writer MessageSink, existingIDs map[int]bool, fileKey string) (bool, error) {
+	file, err := os.Open(legacyPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("打开旧格式文件失败: %w", err)
+	}
+	defer file.Close()
+
+	var pending []MessageRecord
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		var record MessageRecord
+		if jsonErr := json.Unmarshal(scanner.Bytes(), &record); jsonErr != nil {
+			continue
+		}
+		if !existingIDs[record.ID] {
+			pending = append(pending, record)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("读取旧格式文件失败: %w", err)
+	}
+
+	if len(pending) == 0 {
+		return false, nil
+	}
+
+	LogInfo("[%s] 从旧格式文件迁移 %d 条记录到按日期目录...", fileKey, len(pending))
+	for _, record := range pending {
+		if writeErr := writer.Write(record); writeErr != nil {
+			return false, fmt.Errorf("迁移写入失败: %w", writeErr)
+		}
+	}
+	LogInfo("[%s] 迁移写入完成", fileKey)
+	return true, nil
+}
+
+// sortJSONLFile 将单个 JSONL 文件内的记录按 Timestamp 升序重排（原子替换）。
+func sortJSONLFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("读取文件失败 (%s): %w", path, err)
+	}
+
+	var records []MessageRecord
+	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		var record MessageRecord
+		if jsonErr := json.Unmarshal([]byte(line), &record); jsonErr != nil {
+			continue
+		}
+		records = append(records, record)
+	}
+
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].Timestamp < records[j].Timestamp
+	})
+
+	tmpPath := path + ".tmp"
+	tmpFile, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("创建临时文件失败: %w", err)
+	}
+
+	writer := bufio.NewWriter(tmpFile)
+	for _, record := range records {
+		line, marshalErr := json.Marshal(record)
+		if marshalErr != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return marshalErr
+		}
+		fmt.Fprintf(writer, "%s\n", line)
+	}
+	if err := writer.Flush(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("写入临时文件失败: %w", err)
+	}
+	tmpFile.Close()
+
+	return os.Rename(tmpPath, path)
+}
+
+// sortChannelDir 对频道目录下所有 .json 文件按时间戳排序。
+func sortChannelDir(dirPath, fileKey string) error {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return fmt.Errorf("读取频道目录失败: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		filePath := filepath.Join(dirPath, entry.Name())
+		if err := sortJSONLFile(filePath); err != nil {
+			return fmt.Errorf("[%s] 排序文件失败 (%s): %w", fileKey, entry.Name(), err)
+		}
+	}
+	LogInfo("[%s] 按日期文件排序完成", fileKey)
+	return nil
 }
 
 func extractEntities(text string, entities []tg.MessageEntityClass) []EntityInfo {
@@ -647,68 +863,75 @@ write:
 	return nil
 }
 
-func main() {
-	proxyFlag := flag.String("proxy", "", "SOCKS5 代理地址，格式 socks5://[user:pass@]host:port\n留空则依次读取 ALL_PROXY 环境变量，最终兜底 "+DEFAULT_PROXY)
-	outputPath := flag.String("output", DEFAULT_OUTPUT, "消息输出文件（JSONL 格式），多频道共用\n被 -output-dir 覆盖时忽略")
-	outputDir := flag.String("output-dir", "", "消息输出目录，优先级高于 -output\n每个频道写入 {channel username}.jsonl")
-	channelsFlag := flag.String("channels", "", "要监听的频道用户名，逗号分隔\n覆盖 TG_CHANNEL_USERNAME 环境变量")
-	fetchHistory := flag.Bool("history", false, "跳过「是否拉取历史消息」的交互确认，直接开始拉取")
-	pageSize := flag.Int("page-size", DEFAULT_PAGE_SIZE, "每次拉取历史消息的条数，默认 100，最大 "+strconv.Itoa(MAX_PAGE_SIZE))
-	stopOnDup := flag.Bool("auto-stop", false, "翻页时遇到已存在的消息，自动停止而不弹确认提示。\n否则用于回填历史消息空缺。")
+// RunOptions 解析自 CLI flags 的运行参数
+type RunOptions struct {
+	ProxyFlag    string
+	OutputPath   string
+	OutputDir    string
+	ChannelsFlag string
+	FetchHistory bool
+	PageSize     int
+	StopOnDup    bool
+}
+
+func parseFlags() *RunOptions {
+	opts := &RunOptions{}
+	flag.StringVar(&opts.ProxyFlag, "proxy", "", "SOCKS5 代理地址，格式 socks5://[user:pass@]host:port\n留空则依次读取 ALL_PROXY 环境变量，最终兜底 "+DEFAULT_PROXY)
+	flag.StringVar(&opts.OutputPath, "output", DEFAULT_OUTPUT, "消息输出文件（JSONL 格式），多频道共用\n被 -output-dir 覆盖时忽略")
+	flag.StringVar(&opts.OutputDir, "output-dir", "", "消息输出目录，优先级高于 -output\n每个频道写入 {channel}/{date}.json")
+	flag.StringVar(&opts.ChannelsFlag, "channels", "", "要监听的频道用户名，逗号分隔\n覆盖 TG_CHANNEL_USERNAME 环境变量")
+	flag.BoolVar(&opts.FetchHistory, "history", false, "跳过「是否拉取历史消息」的交互确认，直接开始拉取")
+	flag.IntVar(&opts.PageSize, "page-size", DEFAULT_PAGE_SIZE, "每次拉取历史消息的条数，默认 100，最大 "+strconv.Itoa(MAX_PAGE_SIZE))
+	flag.BoolVar(&opts.StopOnDup, "auto-stop", false, "翻页时遇到已存在的消息，自动停止而不弹确认提示。\n否则用于回填历史消息空缺。")
 	flag.Parse()
 
-	if *pageSize > MAX_PAGE_SIZE {
+	if opts.PageSize > MAX_PAGE_SIZE {
 		LogInfo("-page-size 超过 API 上限，已截断为 %d", MAX_PAGE_SIZE)
-		*pageSize = MAX_PAGE_SIZE
+		opts.PageSize = MAX_PAGE_SIZE
 	}
-	if *pageSize < 1 {
-		*pageSize = 1
+	if opts.PageSize < 1 {
+		opts.PageSize = 1
 	}
+	return opts
+}
 
-	config, err := loadConfig()
-	if err != nil {
-		LogError(err, "配置读取失败")
-		return
-	}
+// RealtimeBuffer 缓冲历史写入期间收到的实时消息，防止文件乱序
+type RealtimeBuffer struct {
+	mu          sync.Mutex
+	buf         []MessageRecord
+	historyDone bool
+}
 
-	// -channels flag 优先级高于 TG_CHANNEL_USERNAME 环境变量
-	if *channelsFlag != "" {
-		config.ChannelUsernames = parseUsernames(*channelsFlag)
-	}
-	if len(config.ChannelUsernames) == 0 {
-		LogError(errors.New("未指定任何频道"), "请通过 -channels flag 或 TG_CHANNEL_USERNAME 环境变量提供频道名")
-		return
-	}
+// append 追加一条实时消息到缓冲区（仅限历史未完成时调用）
+func (b *RealtimeBuffer) append(record MessageRecord) {
+	b.mu.Lock()
+	b.buf = append(b.buf, record)
+	b.mu.Unlock()
+}
 
-	// Telegram 使用原始 TCP，需通过 SOCKS5 代理
-	proxyURL := resolveProxyURL(*proxyFlag)
-	LogInfo("使用代理: %s", proxyURL)
-	contextDialer, err := newProxyDialer(proxyURL)
-	if err != nil {
-		LogError(err, "初始化代理失败")
-		return
-	}
+// isHistoryDone 返回历史消息是否已写完
+func (b *RealtimeBuffer) isHistoryDone() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.historyDone
+}
 
-	// 历史写入完成前缓冲实时消息，防止文件乱序
-	var (
-		rtMu          sync.Mutex
-		rtBuf         []MessageRecord
-		rtHistoryDone bool
-	)
+// drain 标记历史已完成并取出所有缓冲消息
+func (b *RealtimeBuffer) drain() []MessageRecord {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.historyDone = true
+	records := b.buf
+	b.buf = nil
+	return records
+}
 
-	// channelCtxMap 在 Run 内部填充后供 dispatcher 使用
-	channelCtxMap := make(map[int64]*ChannelCtx)
-
-	dispatcher := tg.NewUpdateDispatcher()
-	opts := telegram.Options{
-		SessionStorage: &session.FileStorage{Path: SESSION_FILE},
-		Resolver:       dcs.Plain(dcs.PlainOptions{Dial: contextDialer.DialContext}),
-		UpdateHandler:  dispatcher,
-	}
-
-	client := telegram.NewClient(config.AppID, config.AppHash, opts)
-	flow := auth.NewFlow(TerminalAuth{phone: config.Phone}, auth.SendCodeOptions{})
-
+// registerMessageHandler 注册实时消息处理器
+func registerMessageHandler(
+	dispatcher *tg.UpdateDispatcher,
+	channelCtxMap map[int64]*ChannelCtx,
+	rtBuf *RealtimeBuffer,
+) {
 	dispatcher.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, update *tg.UpdateNewChannelMessage) error {
 		msg, ok := update.Message.(*tg.Message)
 		if !ok || msg.Message == "" {
@@ -728,19 +951,234 @@ func main() {
 		record := buildRecord(msg, int64(chCtx.Channel.ID), chCtx.Channel.Title)
 		printRecord(record, "实时")
 
-		rtMu.Lock()
-		if !rtHistoryDone {
-			rtBuf = append(rtBuf, record)
-			rtMu.Unlock()
+		if !rtBuf.isHistoryDone() {
+			rtBuf.append(record)
 			return nil
 		}
-		rtMu.Unlock()
 
-		if writeErr := chCtx.Writer.Write(record); writeErr != nil {
-			LogError(writeErr, "[%s] 写入实时消息失败", chCtx.Channel.Title)
+		if err := chCtx.Writer.Write(record); err != nil {
+			LogError(err, "[%s] 写入实时消息失败", chCtx.Channel.Title)
 		}
 		return nil
 	})
+}
+
+// initChannelCtx 解析、加入单个频道并初始化其 ChannelCtx
+func initChannelCtx(
+	ctx context.Context,
+	api *tg.Client,
+	username string,
+	opts *RunOptions,
+) (*ChannelCtx, error) {
+	resolved, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{
+		Username: username,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("解析频道失败 (%s): %w", username, err)
+	}
+
+	var channel *tg.Channel
+	for _, chat := range resolved.Chats {
+		if ch, ok := chat.(*tg.Channel); ok {
+			channel = ch
+			break
+		}
+	}
+	if channel == nil {
+		return nil, fmt.Errorf("未找到频道: %s", username)
+	}
+
+	LogInfo("成功解析频道: %s (ID: %d)", channel.Title, channel.ID)
+
+	if err := joinChannelIfNeeded(ctx, api, channel); err != nil {
+		return nil, err
+	}
+
+	fileKey := channelFileKey(channel)
+	existingIDs, err := loadChannelExistingIDs(opts.OutputPath, opts.OutputDir, fileKey, int64(channel.ID))
+	if err != nil {
+		return nil, err
+	}
+	if len(existingIDs) > 0 {
+		LogInfo("[%s] 检测到已有 %d 条消息记录", channel.Title, len(existingIDs))
+	}
+
+	writer, err := openChannelWriter(opts.OutputPath, opts.OutputDir, fileKey, localZone())
+	if err != nil {
+		return nil, fmt.Errorf("[%s] 初始化输出文件失败: %w", channel.Title, err)
+	}
+
+	if opts.OutputDir != "" {
+		legacyPath := filepath.Join(opts.OutputDir, fileKey+".jsonl")
+		migrated, err := migrateLegacyJSONL(legacyPath, writer, existingIDs, fileKey)
+		if err != nil {
+			return nil, fmt.Errorf("[%s] 迁移旧格式文件失败: %w", channel.Title, err)
+		}
+		if migrated {
+			// 关闭 writer 确保数据落盘后再排序，排序完重新打开
+			writer.Close()
+			channelDir := filepath.Join(opts.OutputDir, fileKey)
+			if err := sortChannelDir(channelDir, fileKey); err != nil {
+				return nil, fmt.Errorf("[%s] 排序失败: %w", channel.Title, err)
+			}
+			writer, err = openChannelWriter(opts.OutputPath, opts.OutputDir, fileKey, localZone())
+			if err != nil {
+				return nil, fmt.Errorf("[%s] 重新初始化输出文件失败: %w", channel.Title, err)
+			}
+			// 迁移后重新加载，确保 ExistingIDs 包含迁移的记录，-auto-stop 才能正确触发
+			existingIDs, err = loadChannelExistingIDs(opts.OutputPath, opts.OutputDir, fileKey, int64(channel.ID))
+			if err != nil {
+				return nil, fmt.Errorf("[%s] 重新加载消息 ID 失败: %w", channel.Title, err)
+			}
+		}
+	}
+
+	return &ChannelCtx{
+		Channel: channel,
+		Peer: &tg.InputPeerChannel{
+			ChannelID:  channel.ID,
+			AccessHash: channel.AccessHash,
+		},
+		Writer:      writer,
+		ExistingIDs: existingIDs,
+	}, nil
+}
+
+// initAllChannels 逐一初始化所有频道并填充 channelCtxMap
+func initAllChannels(
+	ctx context.Context,
+	api *tg.Client,
+	usernames []string,
+	opts *RunOptions,
+	channelCtxMap map[int64]*ChannelCtx,
+) error {
+	for _, username := range usernames {
+		chCtx, err := initChannelCtx(ctx, api, username, opts)
+		if err != nil {
+			return err
+		}
+		channelCtxMap[int64(chCtx.Channel.ID)] = chCtx
+	}
+	return nil
+}
+
+// fetchAllHistories 按顺序为每个频道拉取历史消息（串行，避免并发 stdin 竞争）
+func fetchAllHistories(
+	ctx context.Context,
+	api *tg.Client,
+	channelCtxMap map[int64]*ChannelCtx,
+	usernames []string,
+	opts *RunOptions,
+) error {
+	for _, username := range usernames {
+		var chCtx *ChannelCtx
+		for _, c := range channelCtxMap {
+			if strings.EqualFold(c.Channel.Username, username) {
+				chCtx = c
+				break
+			}
+		}
+		if chCtx == nil {
+			continue
+		}
+		if err := fetchHistoryInteractive(ctx, api, chCtx, opts.PageSize, opts.FetchHistory, opts.StopOnDup); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// flushBufferedMessages 将缓冲期间积累的实时消息追加写入对应频道
+func flushBufferedMessages(records []MessageRecord, channelCtxMap map[int64]*ChannelCtx) {
+	if len(records) == 0 {
+		return
+	}
+	LogInfo("追加写入缓冲期间收到的 %d 条实时消息...", len(records))
+	for _, record := range records {
+		chCtx, ok := channelCtxMap[record.ChannelID]
+		if !ok {
+			continue
+		}
+		if err := chCtx.Writer.Write(record); err != nil {
+			LogError(err, "[%s] 写入缓冲消息失败", record.Channel)
+		}
+	}
+}
+
+// runSession 完成鉴权后执行：初始化频道、拉取历史、进入实时监听
+func runSession(
+	ctx context.Context,
+	client *telegram.Client,
+	flow auth.Flow,
+	opts *RunOptions,
+	config *AppConfig,
+	channelCtxMap map[int64]*ChannelCtx,
+	rtBuf *RealtimeBuffer,
+) error {
+	if err := client.Auth().IfNecessary(ctx, flow); err != nil {
+		return fmt.Errorf("鉴权失败: %w", err)
+	}
+	LogInfo("登录成功，账号: %s", config.Phone)
+
+	api := client.API()
+
+	if err := initAllChannels(ctx, api, config.ChannelUsernames, opts, channelCtxMap); err != nil {
+		return err
+	}
+	for _, chCtx := range channelCtxMap {
+		defer chCtx.Writer.Close()
+	}
+
+	if err := fetchAllHistories(ctx, api, channelCtxMap, config.ChannelUsernames, opts); err != nil {
+		return err
+	}
+
+	flushBufferedMessages(rtBuf.drain(), channelCtxMap)
+
+	LogInfo("进入实时监听模式，等待新消息... (Ctrl+C 退出)")
+	<-ctx.Done()
+	LogInfo("收到退出信号，正在关闭...")
+	return nil
+}
+
+func main() {
+	opts := parseFlags()
+
+	config, err := loadConfig()
+	if err != nil {
+		LogError(err, "配置读取失败")
+		return
+	}
+
+	if opts.ChannelsFlag != "" {
+		config.ChannelUsernames = parseUsernames(opts.ChannelsFlag)
+	}
+	if len(config.ChannelUsernames) == 0 {
+		LogError(errors.New("未指定任何频道"), "请通过 -channels flag 或 TG_CHANNEL_USERNAME 环境变量提供频道名")
+		return
+	}
+
+	proxyURL := resolveProxyURL(opts.ProxyFlag)
+	LogInfo("使用代理: %s", proxyURL)
+	contextDialer, err := newProxyDialer(proxyURL)
+	if err != nil {
+		LogError(err, "初始化代理失败")
+		return
+	}
+
+	channelCtxMap := make(map[int64]*ChannelCtx)
+	rtBuf := &RealtimeBuffer{}
+
+	dispatcher := tg.NewUpdateDispatcher()
+	registerMessageHandler(&dispatcher, channelCtxMap, rtBuf)
+
+	clientOpts := telegram.Options{
+		SessionStorage: &session.FileStorage{Path: SESSION_FILE},
+		Resolver:       dcs.Plain(dcs.PlainOptions{Dial: contextDialer.DialContext}),
+		UpdateHandler:  dispatcher,
+	}
+	client := telegram.NewClient(config.AppID, config.AppHash, clientOpts)
+	flow := auth.NewFlow(TerminalAuth{phone: config.Phone}, auth.SendCodeOptions{})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -748,107 +1186,8 @@ func main() {
 	LogInfo("正在启动 Telegram 客户端...")
 
 	err = client.Run(ctx, func(ctx context.Context) error {
-		if err := client.Auth().IfNecessary(ctx, flow); err != nil {
-			return fmt.Errorf("鉴权失败: %w", err)
-		}
-		LogInfo("登录成功，账号: %s", config.Phone)
-
-		api := client.API()
-
-		// 逐一解析、加入频道并初始化 ChannelCtx
-		for _, username := range config.ChannelUsernames {
-			resolved, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{
-				Username: username,
-			})
-			if err != nil {
-				return fmt.Errorf("解析频道失败 (%s): %w", username, err)
-			}
-
-			var channel *tg.Channel
-			for _, chat := range resolved.Chats {
-				if ch, ok := chat.(*tg.Channel); ok {
-					channel = ch
-					break
-				}
-			}
-			if channel == nil {
-				return fmt.Errorf("未找到频道: %s", username)
-			}
-
-			LogInfo("成功解析频道: %s (ID: %d)", channel.Title, channel.ID)
-
-			if err := joinChannelIfNeeded(ctx, api, channel); err != nil {
-				return err
-			}
-
-			fileKey := channelFileKey(channel)
-			idPath, filterID := resolveExistingIDsPath(*outputPath, *outputDir, fileKey, int64(channel.ID))
-			existingIDs, err := loadExistingIDs(idPath, filterID)
-			if err != nil {
-				return err
-			}
-			if len(existingIDs) > 0 {
-				LogInfo("[%s] 检测到已有 %d 条消息记录", channel.Title, len(existingIDs))
-			}
-
-			writer, err := openChannelWriter(*outputPath, *outputDir, fileKey)
-			if err != nil {
-				return fmt.Errorf("[%s] 初始化输出文件失败: %w", channel.Title, err)
-			}
-			defer writer.Close()
-
-			channelCtxMap[int64(channel.ID)] = &ChannelCtx{
-				Channel: channel,
-				Peer: &tg.InputPeerChannel{
-					ChannelID:  channel.ID,
-					AccessHash: channel.AccessHash,
-				},
-				Writer:      writer,
-				ExistingIDs: existingIDs,
-			}
-		}
-
-		// 按频道顺序拉取历史消息（串行，避免并发 stdin 竞争）
-		for _, username := range config.ChannelUsernames {
-			var chCtx *ChannelCtx
-			for _, ctx2 := range channelCtxMap {
-				if strings.EqualFold(ctx2.Channel.Username, username) {
-					chCtx = ctx2
-					break
-				}
-			}
-			if chCtx == nil {
-				continue
-			}
-			if err := fetchHistoryInteractive(ctx, api, chCtx, *pageSize, *fetchHistory, *stopOnDup); err != nil {
-				return err
-			}
-		}
-
-		// 历史全部写完，取出缓冲期间的实时消息按频道追加
-		rtMu.Lock()
-		rtHistoryDone = true
-		buffered := rtBuf
-		rtBuf = nil
-		rtMu.Unlock()
-
-		if len(buffered) > 0 {
-			LogInfo("追加写入缓冲期间收到的 %d 条实时消息...", len(buffered))
-			for _, record := range buffered {
-				if chCtx, ok := channelCtxMap[record.ChannelID]; ok {
-					if writeErr := chCtx.Writer.Write(record); writeErr != nil {
-						LogError(writeErr, "[%s] 写入缓冲消息失败", record.Channel)
-					}
-				}
-			}
-		}
-
-		LogInfo("进入实时监听模式，等待新消息... (Ctrl+C 退出)")
-		<-ctx.Done()
-		LogInfo("收到退出信号，正在关闭...")
-		return nil
+		return runSession(ctx, client, flow, opts, config, channelCtxMap, rtBuf)
 	})
-
 	if err != nil && !errors.Is(err, context.Canceled) {
 		LogError(err, "客户端运行异常")
 	}
