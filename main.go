@@ -255,7 +255,7 @@ func (w *MessageWriter) Close() error {
 }
 
 // DateRotatingWriter 按 UTC+8 日期分文件写入器（用于 -output-dir 模式）
-// 文件路径格式：{baseDir}/2006-01-02.json
+// 文件路径格式：{baseDir}/2006-01-02.jsonl
 type DateRotatingWriter struct {
 	mu      sync.Mutex
 	baseDir string
@@ -286,7 +286,7 @@ func (w *DateRotatingWriter) getOrCreateFile(dateKey string) (*os.File, error) {
 	if f, ok := w.files[dateKey]; ok {
 		return f, nil
 	}
-	filePath := filepath.Join(w.baseDir, dateKey+".json")
+	filePath := filepath.Join(w.baseDir, dateKey+".jsonl")
 	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("打开日期文件失败 (%s): %w", filePath, err)
@@ -355,7 +355,7 @@ func loadExistingIDsFromFile(path string, channelID int64) (map[int]bool, error)
 	return existingIDs, scanner.Err()
 }
 
-// loadExistingIDsFromDir 扫描目录下所有 .json 文件，收集已有的消息 ID 集合。
+// loadExistingIDsFromDir 扫描目录下所有 .jsonl 文件，收集已有的消息 ID 集合。
 func loadExistingIDsFromDir(dirPath string) (map[int]bool, error) {
 	entries, err := os.ReadDir(dirPath)
 	if err != nil {
@@ -367,7 +367,7 @@ func loadExistingIDsFromDir(dirPath string) (map[int]bool, error) {
 
 	existingIDs := make(map[int]bool)
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
 		ids, err := loadExistingIDsFromFile(filepath.Join(dirPath, entry.Name()), 0)
@@ -398,7 +398,7 @@ func channelFileKey(channel *tg.Channel) string {
 }
 
 // openChannelWriter 根据是否指定输出目录决定写入器类型。
-// 有 outputDir 时返回 DateRotatingWriter（{outputDir}/{fileKey}/{date}.json）；
+// 有 outputDir 时返回 DateRotatingWriter（{outputDir}/{fileKey}/{date}.jsonl）；
 // 否则返回共用单文件的 MessageWriter。
 func openChannelWriter(outputPath, outputDir, fileKey string, zone *time.Location) (MessageSink, error) {
 	if outputDir != "" {
@@ -409,7 +409,7 @@ func openChannelWriter(outputPath, outputDir, fileKey string, zone *time.Locatio
 }
 
 // loadChannelExistingIDs 根据输出模式加载已有消息 ID。
-// 有 outputDir 时扫描频道子目录下所有 .json 文件；无 outputDir 时从共用文件按 channelID 过滤。
+// 有 outputDir 时扫描频道子目录下所有 .jsonl 文件；无 outputDir 时从共用文件按 channelID 过滤。
 func loadChannelExistingIDs(outputPath, outputDir, fileKey string, channelID int64) (map[int]bool, error) {
 	if outputDir == "" {
 		return loadExistingIDsFromFile(outputPath, channelID)
@@ -509,7 +509,7 @@ func sortJSONLFile(path string) error {
 	return os.Rename(tmpPath, path)
 }
 
-// sortChannelDir 对频道目录下所有 .json 文件按时间戳排序。
+// sortChannelDir 对频道目录下所有 .jsonl 文件按时间戳排序。
 func sortChannelDir(dirPath, fileKey string) error {
 	entries, err := os.ReadDir(dirPath)
 	if err != nil {
@@ -517,7 +517,7 @@ func sortChannelDir(dirPath, fileKey string) error {
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
 		filePath := filepath.Join(dirPath, entry.Name())
@@ -878,7 +878,7 @@ func parseFlags() *RunOptions {
 	opts := &RunOptions{}
 	flag.StringVar(&opts.ProxyFlag, "proxy", "", "SOCKS5 代理地址，格式 socks5://[user:pass@]host:port\n留空则依次读取 ALL_PROXY 环境变量，最终兜底 "+DEFAULT_PROXY)
 	flag.StringVar(&opts.OutputPath, "output", DEFAULT_OUTPUT, "消息输出文件（JSONL 格式），多频道共用\n被 -output-dir 覆盖时忽略")
-	flag.StringVar(&opts.OutputDir, "output-dir", "", "消息输出目录，优先级高于 -output\n每个频道写入 {channel}/{date}.json")
+	flag.StringVar(&opts.OutputDir, "output-dir", "", "消息输出目录，优先级高于 -output\n每个频道写入 {channel}/{date}.jsonl")
 	flag.StringVar(&opts.ChannelsFlag, "channels", "", "要监听的频道用户名，逗号分隔\n覆盖 TG_CHANNEL_USERNAME 环境变量")
 	flag.BoolVar(&opts.FetchHistory, "history", false, "跳过「是否拉取历史消息」的交互确认，直接开始拉取")
 	flag.IntVar(&opts.PageSize, "page-size", DEFAULT_PAGE_SIZE, "每次拉取历史消息的条数，默认 100，最大 "+strconv.Itoa(MAX_PAGE_SIZE))
